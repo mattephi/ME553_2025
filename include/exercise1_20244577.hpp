@@ -11,7 +11,7 @@
 #include <tinyxml_rai/tinyxml_rai.h>
 #include <map>
 #include <utility>
-#include <stdio.h>
+#include <cstdio>
 
 
 /*
