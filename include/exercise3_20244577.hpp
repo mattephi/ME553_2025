@@ -1,7 +1,5 @@
 #pragma once
 
-#define ASSIGNMENT_DEBUG
-
 #include <Eigen/Core>
 #include <tinyxml_rai/tinyxml_rai.h>
 #include <map>
@@ -29,6 +27,10 @@ inline Eigen::Matrix3d RZYX(Eigen::Vector3d p) {
     return RZ(p[2]) * RY(p[1]) * RX(p[0]);
 }
 
+inline Eigen::Matrix3d RAA(const Eigen::Vector3d& axis, double angle) {
+    return Eigen::AngleAxisd(angle, axis.normalized()).toRotationMatrix();
+};
+
 inline Eigen::Matrix3d skewSymmetric(const Eigen::Vector3d& v) {
     Eigen::Matrix3d m;
     m << 0, -v.z(), v.y(),
@@ -44,22 +46,6 @@ struct Placement {
     Placement() = default;
 
     Placement(Eigen::Vector3d p, Eigen::Matrix3d R) : p(std::move(p)), R(std::move(R)) {
-    }
-
-    // Eigen::Matrix<double, 6, 6> adj() {
-    //     Eigen::Matrix3d p_skew = (Eigen::Matrix3d() << 0, -p[2], p[1], p[2], 0, -p[0], -p[1], p[0], 0).finished();
-    //     Eigen::Matrix<double, 6, 6> adj;
-    //     adj << R, Eigen::Matrix3d::Zero(), p_skew * R, R;
-    //     return adj;
-    // }
-    Eigen::Matrix<double, 6, 6> adj() {
-        Eigen::Matrix3d p_skew = skewSymmetric(p);
-        Eigen::Matrix<double, 6, 6> Adj = Eigen::Matrix<double, 6, 6>::Zero();
-        Adj.block<3, 3>(0, 0) = R;
-        // Adj.block<3, 3>(3, 0) = -R * p_skew;
-        Adj.block<3, 3>(3, 0) = p_skew * R;
-        Adj.block<3, 3>(3, 3) = R;
-        return Adj;
     }
 };
 
@@ -124,21 +110,87 @@ struct Node {
     Eigen::VectorXd v = Eigen::VectorXd::Zero(0);
     Eigen::Vector3d axis = Eigen::Vector3d::Zero();
     Eigen::Vector<double, 6> origin = Eigen::Vector<double, 6>::Zero();
+    std::shared_ptr<Placement> placement = nullptr;
 
     // Dynamics
     double mass = 0.0;
-    Eigen::Matrix3d inertia = Eigen::Matrix3d::Identity();
+    Eigen::Matrix3d inertia = Eigen::Matrix3d::Zero();
     Eigen::Vector<double, 6> iorigin = Eigen::Vector<double, 6>::Zero();
 
-    Eigen::Matrix<double, 6, 6> spatialIntertia() const {
-        Eigen::Matrix<double, 6, 6> I = Eigen::Matrix<double, 6, 6>::Identity();
-        Eigen::Matrix3d r_skew = skewSymmetric(iorigin.head(3));
-        /// TODO: Even though cheetah does not have a rotation, implement it
-        // Eigen::Matrix3d R = RZYX(this->iorigin.tail(3));
-        I.block<3, 3>(0, 0) = inertia + mass * r_skew * r_skew.transpose();
-        I.block<3, 3>(3, 3) = mass * Eigen::Matrix3d::Identity();
-        I.block<3, 3>(0, 3) = mass * r_skew;
-        I.block<3, 3>(3, 0) = mass * r_skew.transpose();
+    Eigen::Matrix3d inertia_W() {
+        Placement COM = {iorigin.head(3), RZYX(iorigin.tail(3))};
+        Placement this_W = this->getFramePlacement("world");
+        Eigen::Matrix3d inertia_W = this->inertia;
+        inertia_W = this_W.R * COM.R * inertia_W * COM.R.transpose() * this_W.R.transpose();
+        return inertia_W;
+    }
+
+    Eigen::Vector3d origin_W() {
+        Placement COM = {iorigin.head(3), RZYX(iorigin.tail(3))};
+        Placement this_W = this->getFramePlacement("world");
+        Eigen::Vector3d origin_W = this->iorigin.head(3);
+        origin_W = this_W.p + this_W.R * COM.R * origin_W;
+        return origin_W;
+    }
+
+    std::tuple<Eigen::Matrix3d, Eigen::Vector3d, double> compositeInertia_W() {
+        double thisMass = this->mass;
+        Eigen::Vector3d thisCOM = this->origin_W();
+        Eigen::Matrix3d inertia = this->inertia_W();
+
+        if (this->children.empty()) {
+            return {inertia, thisCOM, thisMass};
+        }
+
+        for (const auto& child : this->children) {
+            double childMass = std::get<2>(child->compositeInertia_W());
+            Eigen::Vector3d childCOM = std::get<1>(child->compositeInertia_W());
+            Eigen::Matrix3d childInertia = std::get<0>(child->compositeInertia_W());
+
+            Eigen::Vector3d newCOM = (thisMass * thisCOM + childMass * childCOM) / (thisMass + childMass);
+            Eigen::Vector3d r1 = thisCOM - newCOM;
+            Eigen::Vector3d r2 = childCOM - newCOM;
+
+            Eigen::Matrix3d newInertia = inertia + childInertia - thisMass * skewSymmetric(r1) * skewSymmetric(r1) -
+                childMass * skewSymmetric(r2) * skewSymmetric(r2);
+            thisMass += childMass;
+            thisCOM = newCOM;
+            inertia = newInertia;
+        }
+
+        if (this->parent->name == "world") {
+            if (this->type == NodeType::FREE_JOINT) {
+                Eigen::Vector3d OC = thisCOM - this->getFramePlacement("world").p;
+                inertia -= thisMass * skewSymmetric(OC) * skewSymmetric(OC);
+            }
+            if (this->type == NodeType::FIXED_JOINT) {
+                throw std::runtime_error("Not implemented");
+            }
+        }
+
+
+        return {inertia, thisCOM, thisMass};
+    }
+
+    Eigen::Matrix<double, 6, 6> spatialInertia_W() {
+        Placement P = this->getFramePlacement("world");
+        double totalMass = std::get<2>(this->compositeInertia_W());
+        Eigen::Vector3d com = std::get<1>(this->compositeInertia_W());
+        Eigen::Matrix3d inertia = std::get<0>(this->compositeInertia_W());
+        Eigen::Vector3d JC = com - P.p;
+
+        Eigen::Matrix<double, 6, 6> I = Eigen::Matrix<double, 6, 6>::Zero();
+        I.block<3, 3>(0, 0) = totalMass * Eigen::Matrix3d::Identity();
+        I.block<3, 3>(0, 3) = -skewSymmetric(JC) * totalMass;
+        I.block<3, 3>(3, 0) = skewSymmetric(JC) * totalMass;
+        I.block<3, 3>(3, 3) = inertia - totalMass * skewSymmetric(JC) * skewSymmetric(JC);
+
+        if (this->parent->name != "world") {
+            I.block<3, 3>(3, 3) = inertia - totalMass * skewSymmetric(JC) * skewSymmetric(JC);
+        }
+        else {
+            I.block<3, 3>(3, 3) = inertia;
+        }
         return I;
     }
 
@@ -164,24 +216,29 @@ struct Node {
         return gv.tail(gv.size() - this->nv);
     }
 
-    Placement getFramePlacement(const std::string& wrt) const {
+    Placement getFramePlacement(const std::string& wrt) {
+        if (placement) {
+            return *placement;
+        }
         if (wrt == this->name) {
+            this->placement = std::make_shared<Placement>();
             return {};
         }
         if (this->parent) {
             Placement P = this->parent->getFramePlacement(wrt);
             P = this->transform(P);
             P = this->actuate(P);
+            this->placement = std::make_shared<Placement>(P);
             return P;
         }
         throw std::invalid_argument("Frame not found: " + wrt);
     }
 
-    virtual Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) const {
+    virtual Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) {
         return Eigen::Vector3d::Zero();
     }
 
-    Eigen::Vector3d getFrameVelocity(std::shared_ptr<Node> frame) const {
+    Eigen::Vector3d getFrameVelocity(std::shared_ptr<Node> frame) {
         Eigen::Vector3d v = Eigen::Vector3d::Zero();
         if (this->parent) {
             v = this->parent->getFrameVelocity(frame);
@@ -190,11 +247,11 @@ struct Node {
         return v;
     }
 
-    virtual Eigen::Vector3d getFrameAngularVelocityEffect(std::shared_ptr<Node> frame) const {
+    virtual Eigen::Vector3d getFrameAngularVelocityEffect(std::shared_ptr<Node> frame) {
         return Eigen::Vector3d::Zero();
     }
 
-    Eigen::Vector3d getFrameAngularVelocity(std::shared_ptr<Node> frame) const {
+    Eigen::Vector3d getFrameAngularVelocity(std::shared_ptr<Node> frame) {
         Eigen::Vector3d v = Eigen::Vector3d::Zero();
         if (this->parent) {
             v = this->parent->getFrameAngularVelocity(frame);
@@ -214,16 +271,18 @@ struct RevoluteJoint final : public Node {
     }
 
     Placement actuate(const Placement& P) const override {
-        return {P.p, P.R * RZYX(this->q[0] * this->axis)};
+        return {P.p, P.R * RAA(this->axis, this->q[0])};
     }
 
     Eigen::MatrixXd jointTwistMap() override {
         Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, this->nv);
-        J.block<3, 1>(0, 0) = this->axis;
+        Eigen::Matrix3d R = this->getFramePlacement("world").R;
+        Eigen::Vector3d axis = R * this->axis;
+        J.block<3, 1>(3, 0) = axis;
         return J;
     }
 
-    Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) const override {
+    Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) override {
         Eigen::Vector3d v = Eigen::Vector3d::Zero();
         Placement frame_P = frame->getFramePlacement("world");
         Placement this_P = this->getFramePlacement("world");
@@ -233,7 +292,7 @@ struct RevoluteJoint final : public Node {
         return v;
     }
 
-    Eigen::Vector3d getFrameAngularVelocityEffect(std::shared_ptr<Node> frame) const override {
+    Eigen::Vector3d getFrameAngularVelocityEffect(std::shared_ptr<Node> frame) override {
         Eigen::Vector3d v = Eigen::Vector3d::Zero();
         Placement frame_P = frame->getFramePlacement("world");
         Placement this_P = this->getFramePlacement("world");
@@ -250,7 +309,9 @@ struct PrismaticJoint final : public Node {
 
     Eigen::MatrixXd jointTwistMap() override {
         Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, this->nv);
-        J.block<3, 1>(3, 0) = this->axis;
+        Eigen::Matrix3d R = this->getFramePlacement("world").R;
+        Eigen::Vector3d axis = R * this->axis;
+        J.block<3, 1>(0, 0) = axis;
         return J;
     }
 
@@ -258,7 +319,7 @@ struct PrismaticJoint final : public Node {
         return {P.p + P.R * this->axis * this->q[0], P.R};
     }
 
-    Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) const override {
+    Eigen::Vector3d getFrameVelocityEffect(std::shared_ptr<Node> frame) override {
         Eigen::Vector3d v = Eigen::Vector3d::Zero();
         Placement frame_P = frame->getFramePlacement("world");
         Placement this_P = this->getFramePlacement("world");
@@ -321,6 +382,7 @@ struct Model {
     bool free = false;
     std::map<std::string, std::shared_ptr<Node>> nodes;
     std::vector<std::shared_ptr<Node>> sorted_nodes;
+    std::vector<std::shared_ptr<Node>> sorted_joints;
 
     void parseDynamics(std::shared_ptr<Node> node, raisim::TiXmlElement* elem) {
         raisim::TiXmlElement* inertial = elem->FirstChildElement("inertial");
@@ -385,6 +447,7 @@ struct Model {
                     sorted_nodes.emplace_back(world);
                     sorted_nodes.emplace_back(free_joint);
                     free = false;
+                    sorted_joints.emplace_back(free_joint);
                 }
                 sorted_nodes.emplace_back(link);
             }
@@ -470,6 +533,7 @@ struct Model {
 
                 nodes[joint->name] = joint;
                 sorted_nodes.emplace_back(joint);
+                sorted_joints.emplace_back(joint);
             }
         }
     }
@@ -495,130 +559,55 @@ struct Model {
             gv_copy = joint->setGeneralizedVelocity(gv_copy);
         }
     }
-};
 
-#ifdef ASSIGNMENT_DEBUG
-
-inline void printNodes(const Model& model) {
-    for (const auto& node : model.sorted_nodes) {
-        std::cout << *node;
+    int sumNv(int end) {
+        int s = 0;
+        for (int i = 0; i < end; i++) {
+            s += sorted_joints[i]->nv;
+        }
+        return s;
     }
-}
-#endif
 
-/// do not change the name of the method
-// inline Eigen::Vector3d getEndEffectorPosition(const Eigen::VectorXd& gc) {
-//     Model model;
-//     model.parseUrdfFromPath(std::string(_MAKE_STR(RESOURCE_DIR)) + "/Panda/panda.urdf");
-//     model.setGeneralizedCoordinates(gc);
-// #ifdef ASSIGNMENT_DEBUG
-//     printNodes(model);
-//     std::cout << model.nodes["panda_rightfinger_tip"]->getFramePlacement("world").p.transpose();
-// #endif
-//     return Eigen::Vector3d::Ones(3);
-// }
+    int jointInd(std::shared_ptr<Node> joint) {
+        for (int i = 0; i < sorted_joints.size(); i++) {
+            if (sorted_joints[i] == joint) {
+                return i;
+            }
+        }
+        return -1;
+    }
 
-/// do not change the name of the method
-// inline Eigen::Vector3d getLinearVelocity(const Eigen::VectorXd& gc, const Eigen::VectorXd& gv) {
-//     //////////////////////////
-//     ///// Your Code Here /////
-//     //////////////////////////
-//
-//     Model model;
-//     model.parseUrdfFromPath(std::string(_MAKE_STR(RESOURCE_DIR)) + "/Panda/panda.urdf");
-//     model.setGeneralizedCoordinates(gc);
-//     model.setGeneralizedVelocities(gv);
-// #ifdef ASSIGNMENT_DEBUG
-//     printNodes(model);
-// #endif
-//     return model.nodes["panda_rightfinger_tip"]->getFrameVelocity(model.nodes["panda_rightfinger_tip"]);
-//     /// replace this
-// }
-
-/// do not change the name of the method
-// inline Eigen::Vector3d getAngularVelocity(const Eigen::VectorXd& gc, const Eigen::VectorXd& gv) {
-//     //////////////////////////
-//     ///// Your Code Here /////
-//     //////////////////////////
-//     Model model;
-//     model.parseUrdfFromPath(std::string(_MAKE_STR(RESOURCE_DIR)) + "/Panda/panda.urdf");
-//     model.setGeneralizedCoordinates(gc);
-//     model.setGeneralizedVelocities(gv);
-// #ifdef ASSIGNMENT_DEBUG
-//     printNodes(model);
-// #endif
-//     return model.nodes["panda_rightfinger_tip"]->getFrameAngularVelocity(model.nodes["panda_rightfinger_tip"]);
-//     /// replace this
-// }
+    Eigen::MatrixXd crba() {
+        Eigen::MatrixXd M = Eigen::MatrixXd::Zero(sumNv(sorted_joints.size()), sumNv(sorted_joints.size()));
+        for (int i = 12; i >= 0; --i) {
+            std::shared_ptr<Node> joint_i = sorted_joints[i];
+            int i_start = sumNv(i);
+            Eigen::MatrixXd Si = joint_i->jointTwistMap();
+            Eigen::Matrix<double, 6, 6> I = joint_i->spatialInertia_W();
+            M.block(i_start, i_start, joint_i->nv, joint_i->nv) = Si.transpose() * I * Si;
+            std::shared_ptr<Node> current = joint_i;
+            while (current->parent->parent) {
+                // j->l->j
+                current = current->parent->parent;
+                Eigen::MatrixXd Sc = current->jointTwistMap();
+                Eigen::VectorXd ic = joint_i->getFramePlacement("world").p - current->getFramePlacement("world").p;
+                Eigen::Matrix<double, 6, 6> IC = Eigen::Matrix<double, 6, 6>::Identity();
+                IC.block<3, 3>(3, 0) = skewSymmetric(ic);
+                int c_start = sumNv(jointInd(current));
+                M.block(c_start, i_start, current->nv, joint_i->nv) = Sc.transpose() * IC * I * Si;
+            }
+        }
+        M.triangularView<Eigen::Lower>() = M.transpose().triangularView<Eigen::Lower>();
+        return M;
+    }
+};
 
 /// do not change the name of the method
 inline Eigen::MatrixXd getMassMatrix(const Eigen::VectorXd& gc) {
     /// !!!!!!!!!! NO RAISIM FUNCTIONS HERE !!!!!!!!!!!!!!!!!
 
     Model model(true);
-    model.parseUrdfFromPath(std::string(std::string(_MAKE_STR(RESOURCE_DIR))) + "/mini_cheetah/urdf/cheetah.urdf");
+    model.parseUrdfFromPath(std::string(_MAKE_STR(RESOURCE_DIR)) + "/mini_cheetah/urdf/cheetah.urdf");
     model.setGeneralizedCoordinates(gc);
-#ifdef ASSIGNMENT_DEBUG
-    printNodes(model);
-    std::cout << "FREE_JOINT: " << model.nodes["free_joint"]->getFramePlacement("world").p.transpose() << std::endl;
-    std::cout << "LF_JOINT1: " << model.nodes["LF_JOINT1"]->getFramePlacement("world").p.transpose() << std::endl;
-    std::cout << "RB_JOINT3: " << model.nodes["RB_JOINT3"]->getFramePlacement("world").p.transpose() << std::endl;
-    std::cout << "LB_JOINT2: " << model.nodes["LB_JOINT2"]->getFramePlacement("world").p.transpose() << std::endl;
-    std::cout << "adjoint: " << model.nodes["LF_JOINT1"]->getFramePlacement("world").adj() << std::endl;
-    {
-        std::cout << "------------------\n";
-        std::cout << "Local RB3:" << std::endl;
-        Eigen::MatrixXd Is = model.nodes["RB3"]->spatialIntertia();
-        std::cout << "spatial inertia of " << model.nodes["RB3"]->name << ":\n" << model.nodes["RB3"]->spatialIntertia()
-            <<
-            std::endl;
-        Eigen::MatrixXd S = model.nodes["RB_JOINT3"]->jointTwistMap();
-        std::cout << "twist map of " << model.nodes["RB_JOINT3"]->name << ":\n" << model.nodes["RB_JOINT3"]->
-            jointTwistMap()
-            <<
-            std::endl;
-        std::cout << "got mass of \n" << S.transpose() * Is * S << std::endl;
-        std::cout << "------------------\n";
-    }
-    {
-        std::cout << "------------------\n";
-        std::cout << "Global RB3\n";
-        Eigen::MatrixXd Is = model.nodes["RB3"]->spatialIntertia();
-        Placement rb3_p = model.nodes["RB3"]->getFramePlacement("world");
-        Eigen::Matrix<double, 6, 6> rb3_adj = rb3_p.adj();
-        std::cout << "spatial inertia of " << model.nodes["RB3"]->name << ":\n" << model.nodes["RB3"]->spatialIntertia()
-            <<
-            std::endl;
-        Eigen::MatrixXd S = model.nodes["RB_JOINT3"]->jointTwistMap();
-        std::cout << "twist map of " << model.nodes["RB_JOINT3"]->name << ":\n" << model.nodes["RB_JOINT3"]->
-            jointTwistMap()
-            <<
-            std::endl;
-        std::cout << "got mass of \n" << (rb3_adj * S).transpose() * rb3_adj.inverse().transpose() * Is * rb3_adj.
-            inverse() *
-            rb3_adj * S << std::endl;
-    }
-    {
-        std::cout << "------------------\n";
-        std::cout << "Local H1717 and H1718\n";
-        Eigen::MatrixXd rb3_Is = model.nodes["RB3"]->spatialIntertia();
-        Placement rb3_p = model.nodes["RB3"]->getFramePlacement("RB2");
-        Eigen::Matrix<double, 6, 6> rb3_adj = rb3_p.adj();
-        // std::cout << "rb3_adj: \n" << rb3_adj << std::endl;
-        // std::cout << "rb3_adj_inv: \n" << rb3_adj.inverse() << std::endl;
-        // std::cout << "rb3_adj_inv_transpose: \n" << rb3_adj.inverse().transpose() << std::endl;
-        Eigen::MatrixXd rb3_Is_rb2 = rb3_adj.inverse().transpose() * rb3_Is * rb3_adj.inverse();
-        // Eigen::MatrixXd rb3_Is_rb2 = rb3_Is;
-        Eigen::MatrixXd rb2_Is = model.nodes["RB2"]->spatialIntertia();
-        Eigen::MatrixXd rb2_comp = rb2_Is + rb3_Is_rb2;
-        Eigen::MatrixXd S2 = model.nodes["RB_JOINT2"]->jointTwistMap();
-        Eigen::MatrixXd S3 = model.nodes["RB_JOINT3"]->jointTwistMap();
-        Eigen::MatrixXd rb2_mass = S2.transpose() * rb2_comp * S2;
-        std::cout << "H1718: " << S2.transpose() * rb2_comp * rb3_adj * S3 << std::endl;
-        std::cout << "RB2 mass: " << rb2_mass << std::endl;
-        // std::cout << "adjoint is: " << rb3_adj << std::endl;
-        std::cout << "------------------\n";
-    }
-#endif
-    return Eigen::MatrixXd::Ones(18, 18);
+    return model.crba();
 }
